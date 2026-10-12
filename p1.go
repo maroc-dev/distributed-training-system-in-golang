@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	// You will need more packages as you go. Add them here when you need
@@ -85,7 +86,90 @@ func RunLocal(cfg LocalConfig) []float64 {
 	// Write your code here.
 	// See project1-desc.pdf, Part 2. Sum partial gradients in rank order so
 	// two runs with the same input return the same result, bit for bit.
-	panic("not implemented yet: Part 2")
+	if cfg.NRanks <= 0 {
+		panic("RunLocal: NRanks must be positive")
+	}
+	if cfg.BatchSize <= 0 || cfg.BatchSize%cfg.NRanks != 0 {
+		panic("RunLocal: NRanks must divide a positive BatchSize")
+	}
+	batcher := NewBatcher(cfg.Seed, cfg.BatchSize)
+
+	// The master also participates in training, so it has its own channels.
+	workers := make([]localWorkerChannels, cfg.NRanks)
+	for workerID := range workers {
+		workers[workerID] = localWorkerChannels{
+			batch:   make(chan []Example, 1),
+			partial: make(chan []float64, 1),
+			total:   make(chan []float64, 1),
+		}
+	}
+	result := make(chan []float64, 1)
+	var finished sync.WaitGroup
+	finished.Add(cfg.NRanks)
+	for workerID := range workers {
+		go runLocalWorker(cfg, workerID, batcher, workers, result, &finished)
+	}
+	finished.Wait()
+	return <-result
+}
+
+type localWorkerChannels struct {
+	batch   chan []Example
+	partial chan []float64
+	total   chan []float64
+}
+
+func runLocalWorker(cfg LocalConfig, workerID int, batcher *Batcher,
+	workers []localWorkerChannels, result chan<- []float64, finished *sync.WaitGroup) {
+	defer finished.Done()
+	const master = 0
+	sliceSize := cfg.BatchSize / cfg.NRanks
+	w := Init(cfg.Seed)
+	for step := 0; step < cfg.Steps; step++ {
+		if workerID == master {
+			batch := batcher.Next(step)
+			for destination := range workers {
+				start := destination * sliceSize
+				workers[destination].batch <- cloneLocalBatch(batch[start : start+sliceSize])
+			}
+		}
+		batch := <-workers[workerID].batch
+		workers[workerID].partial <- Grad(w, batch)
+
+		if workerID == master {
+			full := make([]float64, D)
+			// Receive in numeric order, regardless of completion order.
+			for source := range workers {
+				partial := <-workers[source].partial
+				for i := range full {
+					full[i] += partial[i]
+				}
+			}
+			for destination := range workers {
+				total := make([]float64, D)
+				copy(total, full)
+				workers[destination].total <- total
+			}
+		}
+		total := <-workers[workerID].total
+		for i := range w {
+			w[i] -= cfg.LR * total[i] / float64(cfg.BatchSize)
+		}
+	}
+	if workerID == master {
+		result <- w
+	}
+}
+
+// cloneLocalBatch gives a worker its own examples and feature arrays.
+func cloneLocalBatch(batch []Example) []Example {
+	cloned := make([]Example, len(batch))
+	for i, example := range batch {
+		x := make([]float64, len(example.X))
+		copy(x, example.X)
+		cloned[i] = Example{X: x, Y: example.Y}
+	}
+	return cloned
 }
 
 /* Part 3 -- Coordinator and workers over RPC (65 points). */
