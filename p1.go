@@ -319,8 +319,11 @@ func RunCoordinator(cfg DistConfig) []float64 {
 	if cfg.Steps <= 0 {
 		return w
 	}
+	if cfg.Timeout <= 0 {
+		panic("RunCoordinator: Timeout must be positive")
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	master := distMaster{ctx: ctx, cancel: cancel}
+	master := distMaster{ctx: ctx, cancel: cancel, timeout: cfg.Timeout}
 	seen := make(map[string]bool)
 	for _, addr := range cfg.Workers {
 		addr = strings.TrimSpace(addr)
@@ -336,7 +339,7 @@ func RunCoordinator(cfg DistConfig) []float64 {
 	master.results = make(chan distResult, len(master.workers))
 	defer master.shutdown()
 	for step := 0; step < cfg.Steps; step++ {
-		// Each training step uses a fixed weight snapshot.
+		// Late attempts must retain this step's weights after w is updated.
 		snapshot := append([]float64(nil), w...)
 		gradients := master.trainStep(step, snapshot, batcher.Next(step), cfg.NSlices)
 		full := make([]float64, D)
@@ -359,6 +362,7 @@ func RunCoordinator(cfg DistConfig) []float64 {
 type distMaster struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
+	timeout    time.Duration
 	workers    []distWorker
 	results    chan distResult
 	finished   sync.WaitGroup
@@ -367,13 +371,16 @@ type distMaster struct {
 
 type distWorker struct {
 	addr   string
+	dead   bool
 	active *distAttempt
 }
 
 type distAttempt struct {
-	worker int
-	step   int
-	slice  int
+	worker   int
+	step     int
+	slice    int
+	deadline time.Time
+	expired  bool
 }
 
 type distResult struct {
@@ -383,7 +390,7 @@ type distResult struct {
 }
 
 func (master *distMaster) shutdown() {
-	// Shutdown closes outstanding calls before returning.
+	// Only shutdown cancels outstanding calls; timeouts leave them running.
 	master.cancel()
 	master.finished.Wait()
 }
@@ -400,7 +407,7 @@ func (master *distMaster) availableWorker() int {
 	for offset := range master.workers {
 		workerID := (master.nextWorker + offset) % len(master.workers)
 		worker := &master.workers[workerID]
-		if worker.active == nil {
+		if !worker.dead && worker.active == nil {
 			master.nextWorker = (workerID + 1) % len(master.workers)
 			return workerID
 		}
@@ -411,6 +418,7 @@ func (master *distMaster) availableWorker() int {
 func (master *distMaster) startAttempt(workerID int, args GradArgs) {
 	attempt := &distAttempt{
 		worker: workerID, step: args.Step, slice: args.SliceIndex,
+		deadline: time.Now().Add(master.timeout),
 	}
 	worker := &master.workers[workerID]
 	worker.active = attempt
@@ -422,6 +430,8 @@ func (master *distMaster) startAttempt(workerID int, args GradArgs) {
 func (master *distMaster) runAttempt(attempt *distAttempt, addr string, args GradArgs) {
 	defer master.finished.Done()
 	result := distResult{attempt: attempt}
+	// The scheduler handles soft timeouts, including time spent dialing.
+	// Only coordinator shutdown cancels an attempt that is still connecting.
 	dialer := net.Dialer{}
 	conn, err := dialer.DialContext(master.ctx, "tcp", addr)
 	if err == nil {
@@ -445,28 +455,83 @@ func (master *distMaster) runAttempt(attempt *distAttempt, addr string, args Gra
 
 func (master *distMaster) trainStep(step int, w []float64, batch []Example, nSlices int) [][]float64 {
 	gradients := make([][]float64, nSlices)
+	pending := make([]bool, nSlices)
+	for i := range pending {
+		pending[i] = true
+	}
 	size := len(batch) / nSlices
 	remaining := nSlices
-	nextSlice := 0
 	for remaining > 0 {
-		for nextSlice < nSlices {
+		now := time.Now()
+		live := 0
+		for _, worker := range master.workers {
+			if !worker.dead {
+				live++
+			}
+			attempt := worker.active
+			if attempt != nil && attempt.step == step && gradients[attempt.slice] == nil &&
+				!attempt.expired && !now.Before(attempt.deadline) {
+				attempt.expired = true
+				pending[attempt.slice] = true
+			}
+		}
+		if live == 0 {
+			panic("RunCoordinator: all workers failed before training finished")
+		}
+		for sliceIndex := range pending {
+			if !pending[sliceIndex] || gradients[sliceIndex] != nil {
+				continue
+			}
 			workerID := master.availableWorker()
 			if workerID < 0 {
 				break
 			}
-			start := nextSlice * size
+			start := sliceIndex * size
 			master.startAttempt(workerID, GradArgs{
-				Step: step, SliceIndex: nextSlice, W: w, Batch: batch[start : start+size],
+				Step: step, SliceIndex: sliceIndex, W: w, Batch: batch[start : start+size],
 			})
-			nextSlice++
+			pending[sliceIndex] = false
 		}
-		result := <-master.results
-		master.workers[result.attempt.worker].active = nil
-		if result.err != nil {
-			panic(fmt.Sprintf("RunCoordinator: worker RPC failed: %v", result.err))
+
+		var deadline time.Time
+		for _, worker := range master.workers {
+			attempt := worker.active
+			if attempt != nil && attempt.step == step && !attempt.expired && gradients[attempt.slice] == nil &&
+				(deadline.IsZero() || attempt.deadline.Before(deadline)) {
+				deadline = attempt.deadline
+			}
 		}
-		gradients[result.attempt.slice] = result.gradient
-		remaining--
+		var timer *time.Timer
+		var timeout <-chan time.Time
+		if !deadline.IsZero() {
+			timer = time.NewTimer(time.Until(deadline))
+			timeout = timer.C
+		}
+		select {
+		case result := <-master.results:
+			attempt := result.attempt
+			worker := &master.workers[attempt.worker]
+			worker.active = nil
+			if result.err != nil {
+				worker.dead = true
+			}
+			// Old or duplicate replies release a worker but never alter a sum.
+			if attempt.step == step && gradients[attempt.slice] == nil {
+				if result.err != nil {
+					pending[attempt.slice] = true
+				} else {
+					gradients[attempt.slice] = result.gradient
+					remaining--
+				}
+			}
+		case <-timeout:
+		}
+		if timer != nil && !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
 	}
 	return gradients
 }
