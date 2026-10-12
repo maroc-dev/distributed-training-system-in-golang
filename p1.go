@@ -23,6 +23,8 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
+	"net/rpc"
 	"os"
 	"os/signal"
 	"strings"
@@ -182,7 +184,22 @@ type Worker struct{}
 func (Worker) Grad(args GradArgs, reply *GradReply) error {
 	// Write your code here.
 	// See project1-desc.pdf, Part 3.1.
-	panic("not implemented yet: Part 3.1 (Worker.Grad)")
+	if len(args.W) != D {
+		return fmt.Errorf("Worker.Grad: weight length must be %d", D)
+	}
+	if len(args.Batch) == 0 {
+		return fmt.Errorf("Worker.Grad: batch must not be empty")
+	}
+	for _, example := range args.Batch {
+		if len(example.X) != D {
+			return fmt.Errorf("Worker.Grad: feature length must be %d", D)
+		}
+	}
+	if reply == nil {
+		return fmt.Errorf("Worker.Grad: reply must not be nil")
+	}
+	reply.Grad = Grad(args.W, args.Batch)
+	return nil
 }
 
 // Ping is a health check. Leave it as it is.
@@ -196,7 +213,82 @@ func (Worker) Ping(_ PingArgs, reply *PingReply) error {
 func RunWorker(addr string) (actualAddr string, stop func(), err error) {
 	// Write your code here.
 	// See project1-desc.pdf, Part 3.1.
-	panic("not implemented yet: Part 3.1 (RunWorker)")
+	server, err := newWorkerServer(addr, Worker{})
+	if err != nil {
+		return "", nil, err
+	}
+	return server.listener.Addr().String(), server.stop, nil
+}
+
+type workerServer struct {
+	server      *rpc.Server
+	listener    net.Listener
+	mu          sync.Mutex
+	finished    sync.WaitGroup
+	connections map[net.Conn]struct{}
+	stopped     bool
+	once        sync.Once
+}
+
+func newWorkerServer(addr string, service any) (*workerServer, error) {
+	server := rpc.NewServer()
+	if err := server.RegisterName("Worker", service); err != nil {
+		return nil, err
+	}
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	worker := &workerServer{
+		server: server, listener: listener, connections: make(map[net.Conn]struct{}),
+	}
+	worker.finished.Add(1)
+	go worker.acceptConnections()
+	return worker, nil
+}
+
+func (worker *workerServer) acceptConnections() {
+	defer worker.finished.Done()
+	for {
+		conn, err := worker.listener.Accept()
+		if err != nil {
+			return
+		}
+		worker.mu.Lock()
+		if worker.stopped {
+			worker.mu.Unlock()
+			conn.Close()
+			return
+		}
+		worker.connections[conn] = struct{}{}
+		worker.finished.Add(1)
+		worker.mu.Unlock()
+		go worker.serveConnection(conn)
+	}
+}
+
+func (worker *workerServer) serveConnection(conn net.Conn) {
+	defer worker.finished.Done()
+	worker.server.ServeConn(conn)
+	conn.Close()
+	worker.mu.Lock()
+	delete(worker.connections, conn)
+	worker.mu.Unlock()
+}
+
+func (worker *workerServer) stop() {
+	worker.once.Do(worker.shutdown)
+}
+
+func (worker *workerServer) shutdown() {
+	worker.mu.Lock()
+	worker.stopped = true
+	worker.listener.Close()
+	for conn := range worker.connections {
+		conn.Close()
+	}
+	worker.mu.Unlock()
+	worker.finished.Wait()
 }
 
 // DistConfig holds the inputs to RunCoordinator. Do not add or remove
