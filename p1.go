@@ -51,7 +51,21 @@ type SeqConfig struct {
 func RunSeq(cfg SeqConfig) []float64 {
 	// Write your code here.
 	// See project1-desc.pdf, Part 1 for what this function must do.
-	panic("not implemented yet: Part 1")
+	w := Init(cfg.Seed)
+	b := NewBatcher(cfg.Seed, cfg.BatchSize)
+	for step := 0; step < cfg.Steps; step++ {
+		batch := b.Next(step)
+		g := Grad(w, batch)
+		for i := range w {
+			w[i] -= cfg.LR * g[i] / float64(cfg.BatchSize)
+		}
+		if cfg.OnStep != nil {
+			snapshot := make([]float64, len(w))
+			copy(snapshot, w)
+			cfg.OnStep(step, snapshot)
+		}
+	}
+	return w
 }
 
 /* Part 2 -- Parallel local trainer (15 points). See project1-desc.pdf, Part 2. */
