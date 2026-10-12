@@ -20,6 +20,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -310,7 +311,164 @@ func RunCoordinator(cfg DistConfig) []float64 {
 	// Write your code here.
 	// See project1-desc.pdf, Part 3.2 and Part 3.3.
 	// You are free to add helper types and helper functions.
-	panic("not implemented yet: Part 3 (RunCoordinator)")
+	if cfg.NSlices <= 0 || cfg.BatchSize <= 0 || cfg.BatchSize%cfg.NSlices != 0 {
+		panic("RunCoordinator: NSlices must divide a positive BatchSize")
+	}
+	batcher := NewBatcher(cfg.Seed, cfg.BatchSize)
+	w := Init(cfg.Seed)
+	if cfg.Steps <= 0 {
+		return w
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	master := distMaster{ctx: ctx, cancel: cancel}
+	seen := make(map[string]bool)
+	for _, addr := range cfg.Workers {
+		addr = strings.TrimSpace(addr)
+		if !seen[addr] {
+			master.workers = append(master.workers, distWorker{addr: addr})
+			seen[addr] = true
+		}
+	}
+	if len(master.workers) == 0 {
+		cancel()
+		panic("RunCoordinator: provide at least one worker")
+	}
+	master.results = make(chan distResult, len(master.workers))
+	defer master.shutdown()
+	for step := 0; step < cfg.Steps; step++ {
+		// Each training step uses a fixed weight snapshot.
+		snapshot := append([]float64(nil), w...)
+		gradients := master.trainStep(step, snapshot, batcher.Next(step), cfg.NSlices)
+		full := make([]float64, D)
+		for _, gradient := range gradients {
+			for i := range full {
+				full[i] += gradient[i]
+			}
+		}
+		for i := range w {
+			w[i] -= cfg.LR * full[i] / float64(cfg.BatchSize)
+		}
+		if cfg.OnStep != nil {
+			cfg.OnStep(step, append([]float64(nil), w...))
+		}
+	}
+	return w
+}
+
+// Only the master goroutine mutates scheduling state. RPC goroutines send events.
+type distMaster struct {
+	ctx        context.Context
+	cancel     context.CancelFunc
+	workers    []distWorker
+	results    chan distResult
+	finished   sync.WaitGroup
+	nextWorker int
+}
+
+type distWorker struct {
+	addr   string
+	active *distAttempt
+}
+
+type distAttempt struct {
+	worker int
+	step   int
+	slice  int
+}
+
+type distResult struct {
+	attempt  *distAttempt
+	gradient []float64
+	err      error
+}
+
+func (master *distMaster) shutdown() {
+	// Shutdown closes outstanding calls before returning.
+	master.cancel()
+	master.finished.Wait()
+}
+
+type workerRPCClient struct {
+	client *rpc.Client
+}
+
+func (client *workerRPCClient) close() {
+	client.client.Close()
+}
+
+func (master *distMaster) availableWorker() int {
+	for offset := range master.workers {
+		workerID := (master.nextWorker + offset) % len(master.workers)
+		worker := &master.workers[workerID]
+		if worker.active == nil {
+			master.nextWorker = (workerID + 1) % len(master.workers)
+			return workerID
+		}
+	}
+	return -1
+}
+
+func (master *distMaster) startAttempt(workerID int, args GradArgs) {
+	attempt := &distAttempt{
+		worker: workerID, step: args.Step, slice: args.SliceIndex,
+	}
+	worker := &master.workers[workerID]
+	worker.active = attempt
+	addr := worker.addr
+	master.finished.Add(1)
+	go master.runAttempt(attempt, addr, args)
+}
+
+func (master *distMaster) runAttempt(attempt *distAttempt, addr string, args GradArgs) {
+	defer master.finished.Done()
+	result := distResult{attempt: attempt}
+	dialer := net.Dialer{}
+	conn, err := dialer.DialContext(master.ctx, "tcp", addr)
+	if err == nil {
+		client := &workerRPCClient{client: rpc.NewClient(conn)}
+		closeOnShutdown := context.AfterFunc(master.ctx, client.close)
+		var reply GradReply
+		err = client.client.Call("Worker.Grad", args, &reply)
+		closeOnShutdown()
+		client.close()
+		if err == nil && len(reply.Grad) != D {
+			err = fmt.Errorf("worker returned %d gradient entries, want %d", len(reply.Grad), D)
+		}
+		result.gradient = reply.Grad
+	}
+	result.err = err
+	select {
+	case master.results <- result:
+	case <-master.ctx.Done():
+	}
+}
+
+func (master *distMaster) trainStep(step int, w []float64, batch []Example, nSlices int) [][]float64 {
+	gradients := make([][]float64, nSlices)
+	size := len(batch) / nSlices
+	remaining := nSlices
+	nextSlice := 0
+	for remaining > 0 {
+		for nextSlice < nSlices {
+			workerID := master.availableWorker()
+			if workerID < 0 {
+				break
+			}
+			start := nextSlice * size
+			master.startAttempt(workerID, GradArgs{
+				Step: step, SliceIndex: nextSlice, W: w, Batch: batch[start : start+size],
+			})
+			nextSlice++
+		}
+		result := <-master.results
+		master.workers[result.attempt.worker].active = nil
+		if result.err != nil {
+			panic(fmt.Sprintf("RunCoordinator: worker RPC failed: %v", result.err))
+		}
+		gradients[result.attempt.slice] = result.gradient
+		remaining--
+	}
+	return gradients
 }
 
 /* main -- one binary, four modes. Leave this as it is. */
