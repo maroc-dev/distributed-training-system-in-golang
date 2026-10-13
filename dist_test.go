@@ -21,7 +21,6 @@ func startDistWorker(t *testing.T) (string, func()) {
 	return addr, stop
 }
 
-// These workers deliberately delay or fail RPCs to exercise the scheduler.
 type distTestWorker struct {
 	grad func(GradArgs, *GradReply) error
 }
@@ -111,7 +110,6 @@ func runDistWithDeadline(t *testing.T, cfg DistConfig) []float64 {
 }
 
 func TestWorkerRPC(t *testing.T) {
-	// Two services must coexist without using the global RPC server.
 	for workerID := 0; workerID < 2; workerID++ {
 		addr, stop := startDistWorker(t)
 		client, err := rpc.Dial("tcp", addr)
@@ -138,7 +136,7 @@ func TestWorkerRPC(t *testing.T) {
 				t.Fatal("invalid gradient request succeeded")
 			}
 		}
-		stop() // Shutdown also closes an otherwise idle client connection.
+		stop()
 		stop()
 		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
 		if err == nil {
@@ -260,7 +258,7 @@ func TestCoordinatorStraggler(t *testing.T) {
 				NSlices: 1, Workers: []string{slow, fast}, Timeout: 10 * time.Millisecond}
 			cfg.OnStep = func(step int, w []float64) {
 				if step == 1 {
-					unblock() // The old result now races with later training steps.
+					unblock()
 				}
 			}
 			want := RunSeq(SeqConfig{Seed: cfg.Seed, Steps: cfg.Steps, BatchSize: cfg.BatchSize, LR: cfg.LR})
@@ -312,7 +310,6 @@ func TestCoordinatorBusyWorker(t *testing.T) {
 	var calls atomic.Int32
 	addr := startDistTestWorker(t, func(args GradArgs, reply *GradReply) error {
 		if calls.Add(1) == 1 {
-			// There is no other worker available when this attempt times out.
 			<-time.After(50 * time.Millisecond)
 		}
 		return (Worker{}).Grad(args, reply)

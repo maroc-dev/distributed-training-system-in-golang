@@ -52,7 +52,6 @@ func TestSeqCallbackCopies(t *testing.T) {
 	}
 	assertSeqWeightsEqual(t, snapshots[cfg.Steps-1], baseline)
 
-	// Callback mutations must not change any subsequent training step.
 	calls := 0
 	cfg.OnStep = func(step int, w []float64) {
 		if step != calls || step >= len(saved) {
@@ -69,7 +68,6 @@ func TestSeqCallbackCopies(t *testing.T) {
 		t.Fatalf("callback count = %d, want %d", calls, cfg.Steps)
 	}
 
-	// The final snapshot must also be independent of the returned weights.
 	snapshots[cfg.Steps-1][0] = math.NaN()
 	assertSeqWeightsEqual(t, baseline, saved[cfg.Steps-1])
 }

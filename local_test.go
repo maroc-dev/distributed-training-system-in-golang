@@ -40,8 +40,6 @@ func TestLocalOrderedReduction(t *testing.T) {
 	}
 	for _, cfg := range configs {
 		t.Run(fmt.Sprintf("seed=%d/batch=%d/workers=%d", cfg.Seed, cfg.BatchSize, cfg.NRanks), func(t *testing.T) {
-			// A serial numerical reference checks the prescribed grouping and
-			// order independently of the master's channel protocol.
 			want := Init(cfg.Seed)
 			batcher := NewBatcher(cfg.Seed, cfg.BatchSize)
 			size := cfg.BatchSize / cfg.NRanks

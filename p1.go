@@ -97,7 +97,6 @@ func RunLocal(cfg LocalConfig) []float64 {
 	}
 	batcher := NewBatcher(cfg.Seed, cfg.BatchSize)
 
-	// The master also participates in training, so it has its own channels.
 	workers := make([]localWorkerChannels, cfg.NRanks)
 	for workerID := range workers {
 		workers[workerID] = localWorkerChannels{
@@ -141,7 +140,6 @@ func runLocalWorker(cfg LocalConfig, workerID int, batcher *Batcher,
 
 		if workerID == master {
 			full := make([]float64, D)
-			// Receive in numeric order, regardless of completion order.
 			for source := range workers {
 				partial := <-workers[source].partial
 				for i := range full {
@@ -164,7 +162,6 @@ func runLocalWorker(cfg LocalConfig, workerID int, batcher *Batcher,
 	}
 }
 
-// cloneLocalBatch gives a worker its own examples and feature arrays.
 func cloneLocalBatch(batch []Example) []Example {
 	cloned := make([]Example, len(batch))
 	for i, example := range batch {
@@ -339,7 +336,6 @@ func RunCoordinator(cfg DistConfig) []float64 {
 	master.results = make(chan distResult, len(master.workers))
 	defer master.shutdown()
 	for step := 0; step < cfg.Steps; step++ {
-		// Late attempts must retain this step's weights after w is updated.
 		snapshot := append([]float64(nil), w...)
 		gradients := master.trainStep(step, snapshot, batcher.Next(step), cfg.NSlices)
 		full := make([]float64, D)
@@ -358,7 +354,6 @@ func RunCoordinator(cfg DistConfig) []float64 {
 	return w
 }
 
-// Only the master goroutine mutates scheduling state. RPC goroutines send events.
 type distMaster struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
@@ -390,7 +385,6 @@ type distResult struct {
 }
 
 func (master *distMaster) shutdown() {
-	// Only shutdown cancels outstanding calls; timeouts leave them running.
 	master.cancel()
 	master.finished.Wait()
 }
@@ -430,8 +424,6 @@ func (master *distMaster) startAttempt(workerID int, args GradArgs) {
 func (master *distMaster) runAttempt(attempt *distAttempt, addr string, args GradArgs) {
 	defer master.finished.Done()
 	result := distResult{attempt: attempt}
-	// The scheduler handles soft timeouts, including time spent dialing.
-	// Only coordinator shutdown cancels an attempt that is still connecting.
 	dialer := net.Dialer{}
 	conn, err := dialer.DialContext(master.ctx, "tcp", addr)
 	if err == nil {
@@ -515,7 +507,6 @@ func (master *distMaster) trainStep(step int, w []float64, batch []Example, nSli
 			if result.err != nil {
 				worker.dead = true
 			}
-			// Old or duplicate replies release a worker but never alter a sum.
 			if attempt.step == step && gradients[attempt.slice] == nil {
 				if result.err != nil {
 					pending[attempt.slice] = true
