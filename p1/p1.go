@@ -90,10 +90,10 @@ func RunLocal(cfg LocalConfig) []float64 {
 	// See project1-desc.pdf, Part 2. Sum partial gradients in rank order so
 	// two runs with the same input return the same result, bit for bit.
 	if cfg.NRanks <= 0 {
-		panic("RunLocal: NRanks must be positive")
+		panic("Error RunLocal: NRanks must be positive")
 	}
 	if cfg.BatchSize <= 0 || cfg.BatchSize%cfg.NRanks != 0 {
-		panic("RunLocal: NRanks must divide a positive BatchSize")
+		panic("Error RunLocal: NRanks must divide a positive BatchSize")
 	}
 	batcher := NewBatcher(cfg.Seed, cfg.BatchSize)
 
@@ -309,7 +309,7 @@ func RunCoordinator(cfg DistConfig) []float64 {
 	// See project1-desc.pdf, Part 3.2 and Part 3.3.
 	// You are free to add helper types and helper functions.
 	if cfg.NSlices <= 0 || cfg.BatchSize <= 0 || cfg.BatchSize%cfg.NSlices != 0 {
-		panic("RunCoordinator: NSlices must divide a positive BatchSize")
+		panic("Error RunCoordinator: NSlices must divide a positive BatchSize")
 	}
 	batcher := NewBatcher(cfg.Seed, cfg.BatchSize)
 	w := Init(cfg.Seed)
@@ -317,7 +317,7 @@ func RunCoordinator(cfg DistConfig) []float64 {
 		return w
 	}
 	if cfg.Timeout <= 0 {
-		panic("RunCoordinator: Timeout must be positive")
+		panic("Error RunCoordinator: Timeout must be positive")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	master := distMaster{ctx: ctx, cancel: cancel, timeout: cfg.Timeout}
@@ -331,7 +331,7 @@ func RunCoordinator(cfg DistConfig) []float64 {
 	}
 	if len(master.workers) == 0 {
 		cancel()
-		panic("RunCoordinator: provide at least one worker")
+		panic("Error RunCoordinator: provide at least one worker")
 	}
 	master.results = make(chan distResult, len(master.workers))
 	defer master.shutdown()
@@ -434,7 +434,7 @@ func (master *distMaster) runAttempt(attempt *distAttempt, addr string, args Gra
 		closeOnShutdown()
 		client.close()
 		if err == nil && len(reply.Grad) != D {
-			err = fmt.Errorf("worker returned %d gradient entries, want %d", len(reply.Grad), D)
+			err = fmt.Errorf("worker returned %d entries, expected %d", len(reply.Grad), D)
 		}
 		result.gradient = reply.Grad
 	}
@@ -468,7 +468,7 @@ func (master *distMaster) trainStep(step int, w []float64, batch []Example, nSli
 			}
 		}
 		if live == 0 {
-			panic("RunCoordinator: all workers failed before training finished")
+			panic("Error RunCoordinator: all workers failed before training finished")
 		}
 		for sliceIndex := range pending {
 			if !pending[sliceIndex] || gradients[sliceIndex] != nil {
